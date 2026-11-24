@@ -68,6 +68,24 @@ STOP_TIMEOUT = 10.0
 # restart so the worker resumes in the state the user last left it.
 _PAUSED_KV_KEY = "sync_paused"
 
+# Stop the camera's recording while a cycle touches its SD card (listing,
+# triage range reads, downloads, deletes) and start it again afterwards.
+# Some cameras (seen on a Viofo A129 Plus Duo in parking mode) lose the rear
+# camera until a power cycle when a recording starts while a file is being
+# read over Wi-Fi. The stock phone app stops recording before file access
+# too. Off by default; only acts when the camera reports it is recording.
+PAUSE_RECORDING_DURING_SYNC = os.environ.get(
+    "PAUSE_RECORDING_DURING_SYNC", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+# Seconds to leave the camera alone after recording was started again,
+# so the next cycle never stops (or reads) a recording that is starting.
+RECORD_RESUME_QUIET_S = float(os.environ.get("RECORD_RESUME_QUIET_S", "15"))
+# Seconds after stopping before the first card access (file finalise).
+RECORD_PAUSE_SETTLE_S = float(os.environ.get("RECORD_PAUSE_SETTLE_S", "2"))
+# kv flag: 1 while recording is stopped by us, so a crash/restart or a
+# failed resume is repaired on the next cycle.
+_REC_PAUSED_KV_KEY = "recording_paused_by_sync"
+
 # Mid-drain listing-refresh throttle. Cameras that are slow to
 # report their file listing can take longer to list than a short
 # clip takes to download, so between downloads we only relist once
@@ -413,6 +431,9 @@ class SyncWorker:
         # recordings volume) logs one detailed warning, not hundreds;
         # _flush_drain_failure_summary reports the repeat count.
         self._drain_fail_counts: dict[str, int] = {}
+        # monotonic time recording was last started again by
+        # _resume_recording (PAUSE_RECORDING_DURING_SYNC).
+        self._last_rec_resume: float | None = None
 
     # ---- lifecycle ----
 
@@ -960,6 +981,72 @@ class SyncWorker:
             await self.hub.broadcast({"type": "dashcam_offline"})
             return False
 
+        # Repair a recording pause an earlier run left behind (restart,
+        # crash, failed resume) before anything else.
+        if self._rec_paused_flag():
+            await self._resume_recording(active)
+        paused = await self._pause_recording(active)
+        if paused is None:
+            return False    # couldn't stop recording: no card access now
+        try:
+            return await self._cycle_online()
+        finally:
+            if paused:
+                await self._resume_recording(active)
+
+    # ---- recording pause (PAUSE_RECORDING_DURING_SYNC) ----
+
+    def _rec_paused_flag(self) -> bool:
+        return (self.db is not None
+                and self.db.kv_get(_REC_PAUSED_KV_KEY) == "1")
+
+    def _set_rec_paused_flag(self, on: bool) -> None:
+        if self.db is not None:
+            self.db.kv_set(_REC_PAUSED_KV_KEY, "1" if on else "0")
+
+    async def _pause_recording(self, address: str) -> bool | None:
+        """Stop recording for this cycle's card access.
+
+        True: recording was stopped by us (resume afterwards). False: nothing
+        to do (feature off, or the camera is not recording). None: the camera
+        may be recording and could not be stopped, so skip the cycle."""
+        if not PAUSE_RECORDING_DURING_SYNC:
+            return False
+        if self._last_rec_resume is not None:
+            wait = RECORD_RESUME_QUIET_S - (
+                time.monotonic() - self._last_rec_resume)
+            if wait > 0:
+                await asyncio.sleep(wait)
+        state = await asyncio.to_thread(control.record_state, address)
+        if state == 0:
+            return False
+        if state is None:
+            log.warning("recording state unknown; skipping this sync cycle "
+                        "rather than reading files while it may record")
+            return None
+        self._set_rec_paused_flag(True)
+        ok = await asyncio.to_thread(control.set_recording, address, False)
+        if not ok:
+            log.warning("camera did not stop recording; skipping this sync "
+                        "cycle")
+            await self._resume_recording(address)
+            return None
+        log.info("recording paused for sync")
+        await asyncio.sleep(RECORD_PAUSE_SETTLE_S)
+        return True
+
+    async def _resume_recording(self, address: str) -> bool:
+        ok = await asyncio.to_thread(control.set_recording, address, True)
+        self._last_rec_resume = time.monotonic()
+        if ok:
+            self._set_rec_paused_flag(False)
+            log.info("recording resumed after sync")
+        else:
+            log.warning("could not restart recording after sync; will retry "
+                        "next cycle")
+        return ok
+
+    async def _cycle_online(self) -> bool:
         # Initial listing — failure here aborts the cycle so
         # back-off can kick in. Mid-cycle re-listings (below)
         # are best-effort instead.

@@ -721,6 +721,26 @@ def record_state(address: str) -> int | None:
         return None
 
 
+def set_recording(address: str, on: bool, attempts: int = 3) -> bool:
+    """Start (``on``) or stop recording with ``cmd=2001`` and confirm it via
+    the ``cmd=3014`` record flag. Retries the command up to ``attempts``
+    times. Returns True only once the camera reports the requested state;
+    never raises (an unreachable camera is just a False)."""
+    want = 1 if on else 0
+    for _ in range(max(1, attempts)):
+        try:
+            _send(address, RECORD_CMD, par=want)
+        except CameraUnreachable:
+            time.sleep(RECORD_SETTLE)
+            continue
+        for _ in range(VERIFY_ATTEMPTS):
+            time.sleep(VERIFY_SETTLE)
+            if record_state(address) == want:
+                return True
+        time.sleep(RECORD_SETTLE)
+    return False
+
+
 def _apply_and_verify(address: str, cmd: int, index: int):
     """Send ``cmd&par=index`` then poll cmd=3014 to confirm it applied.
 

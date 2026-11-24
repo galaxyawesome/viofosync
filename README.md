@@ -122,6 +122,16 @@ The only Docker-level env vars are:
 | --------------- | ------------------------------------------------ | ------------ |
 | `PUID` / `PGID` | Owner of `/config` and `/recordings` on the host | host UID/GID |
 | `TZ`            | Timezone for log timestamps                      | UTC          |
+| `PAUSE_RECORDING_DURING_SYNC` | Stop the camera's recording while syncing (see below) | `0` |
+
+**`PAUSE_RECORDING_DURING_SYNC=1`** stops recording (`cmd=2001&par=0`) before each sync cycle touches the camera's SD card (listing, GPS triage, downloads, deletes) and starts it again afterwards, the way the stock phone app does. Use it for cameras that misbehave when a recording starts while a file is being read over Wi-Fi. On a VIOFO A129 Plus Duo in parking mode, that loses the rear camera until a power cycle. Details:
+
+- It only acts when the camera reports it is recording. A camera you stopped yourself is left stopped.
+- After each cycle it always restarts recording, including after errors and cancelled downloads.
+- A restart that fails (camera out of range) is remembered and retried as soon as the camera is back.
+- It leaves the camera alone for `RECORD_RESUME_QUIET_S` (default 15 s) after restarting.
+- Each cycle leaves a gap of a few seconds in the recording.
+- In parking modes where the camera's record flag only switches on per event (motion-triggered parking), it can't pause reliably. Use continuous (low-bitrate / time-lapse) parking with this option.
 
 App-level settings (sync interval, dashcam IP, encoder, geocoding email, web port, retention, password, auto-delete, etc.) are editable on the **Settings** page. Advanced users can hand-edit `/config/config.json` between restarts; the schema lives in `[web/settings_schema.py](web/settings_schema.py)`.
 
